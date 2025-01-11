@@ -168,3 +168,9 @@ cython_debug/
 *tmp*
 
 *.exe
+
+# PointInterpolant
+*PointInterpolant
+
+# Log folder
+*logs/
