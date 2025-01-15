@@ -494,6 +494,7 @@ class TemplateNet(nn.Module):
             dists = torch.cat([dists, dists[..., -1:]], -1)
 
             # query
+            # carry out coordinate transformation if necessary
             if space == "live":
                 cano_pts, near_flag = self.transform_live2cano(pts, batch)
             elif space == "cano":

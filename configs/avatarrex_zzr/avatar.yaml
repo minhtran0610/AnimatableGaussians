@@ -3,7 +3,7 @@ train:
   dataset: MvRgbDatasetAvatarReX
   data:
     subject_name: avatarrex_zzr
-    data_dir: Z:/Data/MultiviewRGB/avatarrex/zzr
+    data_dir: /home/minhtran/Code/raw_datasets/avatarrex/avatarrex_zzr
     frame_range: &id001
     - 0
     - 2001
@@ -50,11 +50,11 @@ train:
 test:
   dataset: MvRgbDatasetAvatarReX
   data:
-    data_dir: Z:/Data/MultiviewRGB/avatarrex/zzr
+    data_dir: /home/minhtran/Code/raw_datasets/avatarrex/avatarrex_zzr
     frame_range: [0, 500]
     subject_name: avatarrex_zzr
   pose_data:
-    data_path: Z:/Data/Pose/thuman4/pose_00.npz
+    data_path: /home/minhtran/Code/raw_datasets/poses/THuman4/pose_00.npz
     frame_range: [2000, 2500]
 #    data_path: Z:/Data/Pose/AMASS/CMU/06/06_13_poses.npz
 #    data_path: Z:/Data/Pose/AMASS/CMU/10/10_05_poses.npz

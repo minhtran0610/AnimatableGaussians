@@ -80,6 +80,7 @@ def solve(num_joints, point_interpolant_exe):
 
 @torch.no_grad()
 def calc_cano_weight_volume(data_dir, gender="neutral"):
+    # Load weights of SMPL model
     smpl_params = np.load(data_dir + "/smpl_params.npz")
     smpl_shape = torch.from_numpy(smpl_params["betas"][0]).to(torch.float32)
     smpl_model = smplx.SMPLX(
@@ -103,6 +104,7 @@ def calc_cano_weight_volume(data_dir, gender="neutral"):
         pts = np.stack(np.meshgrid(x, y, z, indexing="ij"), axis=-1)
         return pts
 
+    # Create a SMPL instance for canonical pose
     if isinstance(smpl_model, smplx.SMPLX):
         cano_smpl = smpl_model.forward(
             betas=smpl_shape[None],
