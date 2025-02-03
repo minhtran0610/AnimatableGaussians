@@ -54,22 +54,22 @@ test:
     frame_range: [0, 500]
     subject_name: avatarrex_zzr
   pose_data:
-    data_path: /home/minhtran/Code/raw_datasets/poses/THuman4/pose_00.npz
+    data_path: /home/minhtran/Code/raw_datasets/poses/thuman4/pose_00.npz
     frame_range: [2000, 2500]
 #    data_path: Z:/Data/Pose/AMASS/CMU/06/06_13_poses.npz
 #    data_path: Z:/Data/Pose/AMASS/CMU/10/10_05_poses.npz
 #    frame_interval: 4
-  view_setting: free
+  view_setting: front
   render_view_idx: 13
   global_orient: true
   img_scale: 1.0
   save_mesh: false
-  render_skeleton: false
+  render_skeleton: true
   save_tex_map: false
   save_ply: false
   n_pca: 20
   sigma_pca: 2.0
-  prev_ckpt: ./results/avatarrex_zzr/avatar/batch_700000
+  prev_ckpt: ./results/avatarrex_zzr/avatar/epoch_latest
 model:
   with_viewdirs: true
   random_style: false
