@@ -1,32 +1,37 @@
+import collections
+import datetime
+import glob
+import importlib
 import os
+import shutil
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 # os.environ['TORCH_USE_CUDA_DSA'] = '1'
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-import yaml
-import shutil
-import collections
-import torch
-import torch.utils.data
-import torch.nn.functional as F
-import numpy as np
-import cv2 as cv
-import glob
-import datetime
-import trimesh
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
-import importlib
 
 import config
-from network.lpips import LPIPS
-from dataset.dataset_pose import PoseDataset
+import cv2 as cv
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+import torch.utils.data
+import trimesh
 import utils.net_util as net_util
 import utils.visualize_util as visualize_util
-from utils.renderer import Renderer
+import yaml
+from dataset.dataset_pose import PoseDataset
+from gaussians.obj_io import save_gaussians_as_ply
+from network.lpips import LPIPS
+from torch.utils.data import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 from utils.net_util import to_cuda
 from utils.obj_io import save_mesh_as_ply
-from gaussians.obj_io import save_gaussians_as_ply
+from utils.renderer import Renderer
 
 
 def safe_exists(path):
@@ -40,7 +45,7 @@ class AvatarTrainer:
         self.opt = opt
         self.patch_size = 512
         self.iter_idx = 0
-        self.iter_num = 800000
+        self.iter_num = 5000
         self.lr_init = float(self.opt["train"].get("lr_init", 5e-4))
 
         avatar_module = self.opt["model"].get("module", "network.avatar")
@@ -141,7 +146,7 @@ class AvatarTrainer:
         ).mean()
         return lpips_loss
 
-    def forward_one_pass_pretrain(self, items):
+    def forward_one_pass_pretrain(self, items, ddp_avatar_net, ddp_optimizer):
         total_loss = 0
         batch_losses = {}
         l1_loss = torch.nn.L1Loss()
@@ -153,35 +158,39 @@ class AvatarTrainer:
         # The losses are calculated against the canonical Gaussian model
         # All losses are L1 loss
         position_loss = l1_loss(
-            self.avatar_net.get_positions(pose_map),
-            self.avatar_net.cano_gaussian_model.get_xyz,
+            ddp_avatar_net.module.get_positions(pose_map),
+            ddp_avatar_net.module.cano_gaussian_model.get_xyz,
         )
         total_loss += position_loss
         batch_losses.update({"position": position_loss.item()})
 
-        opacity, scales, rotations = self.avatar_net.get_others(pose_map)
-        opacity_loss = l1_loss(opacity, self.avatar_net.cano_gaussian_model.get_opacity)
+        opacity, scales, rotations = ddp_avatar_net.module.get_others(pose_map)
+        opacity_loss = l1_loss(
+            opacity, ddp_avatar_net.module.cano_gaussian_model.get_opacity
+        )
         total_loss += opacity_loss
         batch_losses.update({"opacity": opacity_loss.item()})
 
-        scale_loss = l1_loss(scales, self.avatar_net.cano_gaussian_model.get_scaling)
+        scale_loss = l1_loss(
+            scales, ddp_avatar_net.module.cano_gaussian_model.get_scaling
+        )
         total_loss += scale_loss
         batch_losses.update({"scale": scale_loss.item()})
 
         rotation_loss = l1_loss(
-            rotations, self.avatar_net.cano_gaussian_model.get_rotation
+            rotations, ddp_avatar_net.module.cano_gaussian_model.get_rotation
         )
         total_loss += rotation_loss
         batch_losses.update({"rotation": rotation_loss.item()})
 
         total_loss.backward()
 
-        self.optm.step()
-        self.optm.zero_grad()
+        ddp_optimizer.step()
+        ddp_optimizer.zero_grad()
 
         return total_loss, batch_losses
 
-    def forward_one_pass(self, items):
+    def forward_one_pass(self, items, ddp_avatar_net, ddp_optimizer):
         # forward_start = torch.cuda.Event(enable_timing = True)
         # forward_end = torch.cuda.Event(enable_timing = True)
         # backward_start = torch.cuda.Event(enable_timing = True)
@@ -208,16 +217,16 @@ class AvatarTrainer:
         # Select the neural network parts to optimize
         """ Optimize generator """
         if self.finetune_color:
-            self.requires_net_grad(self.avatar_net.color_net, True)
-            self.requires_net_grad(self.avatar_net.position_net, False)
-            self.requires_net_grad(self.avatar_net.other_net, True)
+            self.requires_net_grad(ddp_avatar_net.color_net, True)
+            self.requires_net_grad(ddp_avatar_net.position_net, False)
+            self.requires_net_grad(ddp_avatar_net.other_net, True)
         else:
-            self.requires_net_grad(self.avatar_net, True)
+            self.requires_net_grad(ddp_avatar_net, True)
 
         # Render the image & crop out the image based on the mask
         # Feedforward actually happens in this rendering step
         # forward_start.record()
-        render_output = self.avatar_net.render(items, self.bg_color)
+        render_output = ddp_avatar_net.module.render(items, self.bg_color)
         image = render_output["rgb_map"].permute(2, 0, 1)
         offset = render_output["offset"]
 
@@ -280,8 +289,8 @@ class AvatarTrainer:
         # backward_end.record()
 
         # step_start.record()
-        self.optm.step()
-        self.optm.zero_grad()
+        ddp_optimizer.step()
+        ddp_optimizer.zero_grad()
         # step_end.record()
 
         # torch.cuda.synchronize()
@@ -291,7 +300,24 @@ class AvatarTrainer:
 
         return total_loss, batch_losses
 
-    def pretrain(self):
+    # Setup distributed process
+    def setup(self, rank, world_size):
+        print()
+        print("Setting up: Rank %d, world size %d" % (rank, world_size))
+        with torch.device(f"cuda:{rank}"):
+            print(f"CUDA device: {torch.cuda.current_device()}")
+            print(
+                "Device name:", torch.cuda.get_device_name(torch.cuda.current_device())
+            )
+            dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    def cleanup(self):
+        dist.destroy_process_group()
+
+    def pretrain(self, rank, world_size):
+        # Setup
+        self.setup(rank, world_size)
+
         dataset_module = self.opt["train"].get("dataset", "MvRgbDatasetAvatarReX")
         MvRgbDataset = importlib.import_module(
             "dataset.dataset_mv_rgb"
@@ -300,12 +326,29 @@ class AvatarTrainer:
         batch_size = self.opt["train"]["batch_size"]
         num_workers = self.opt["train"]["num_workers"]
         batch_num = len(self.dataset) // batch_size
+        # print()
+        # print("Batch number: %d" % batch_num)
+        # print("Batch size: %d" % batch_size)
+
+        # Distributed sampling
+        data_sampler = DistributedSampler(self.dataset)
         dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=batch_size,
-            shuffle=True,
+            # shuffle=True,
             num_workers=num_workers,
             drop_last=True,
+            sampler=data_sampler,
+        )
+        # print("Batch size after distributed sampling: %d" % len(dataloader))
+        # print()
+
+        # Distributed avatar net
+        ddp_avatar_net = torch.nn.parallel.DistributedDataParallel(
+            self.avatar_net, device_ids=[rank]
+        )
+        ddp_optimizer = torch.optim.Adam(
+            ddp_avatar_net.parameters(), lr=self.optm.param_groups[0]["lr"]
         )
 
         # tb writer
@@ -326,7 +369,9 @@ class AvatarTrainer:
                 items = to_cuda(items)
 
                 # one_step_start.record()
-                total_loss, batch_losses = self.forward_one_pass_pretrain(items)
+                total_loss, batch_losses = self.forward_one_pass_pretrain(
+                    items, ddp_avatar_net, ddp_optimizer
+                )
                 # one_step_end.record()
                 # torch.cuda.synchronize()
                 # print('One step costs %f secs' % (one_step_start.elapsed_time(one_step_end) / 1000.))
@@ -365,9 +410,15 @@ class AvatarTrainer:
                     os.makedirs(model_folder, exist_ok=True)
                     self.save_ckpt(model_folder, save_optm=True)
                     self.iter_idx = 0
+
+                    # Clean up
+                    self.cleanup()
                     return
 
-    def train(self):
+    def train(self, rank, world_size):
+        # Setup
+        self.setup(rank, world_size)
+
         dataset_module = self.opt["train"].get("dataset", "MvRgbDatasetAvatarReX")
         MvRgbDataset = importlib.import_module(
             "dataset.dataset_mv_rgb"
@@ -376,13 +427,22 @@ class AvatarTrainer:
         batch_size = self.opt["train"]["batch_size"]
         num_workers = self.opt["train"]["num_workers"]
         batch_num = len(self.dataset) // batch_size
+
+        # Distributed sampling
+        data_sampler = DistributedSampler(self.dataset)
         dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=batch_size,
-            shuffle=True,
+            # shuffle=True,
             num_workers=num_workers,
             drop_last=True,
+            sampler=data_sampler,
         )
+        print()
+        print("Batch number: %d" % batch_num)
+        print("Batch size: %d" % batch_size)
+        print("Batch size after distributed sampling: %d" % len(dataloader))
+        print()
 
         if "lpips" in self.opt["train"]["loss_weight"]:
             self.lpips = LPIPS(net="vgg").to(config.device)
@@ -422,6 +482,14 @@ class AvatarTrainer:
         # one_step_start = torch.cuda.Event(enable_timing = True)
         # one_step_end = torch.cuda.Event(enable_timing = True)
 
+        # Distributed avatar net
+        ddp_avatar_net = torch.nn.parallel.DistributedDataParallel(
+            self.avatar_net, device_ids=[rank]
+        )
+        ddp_optimizer = torch.optim.Adam(
+            ddp_avatar_net.parameters(), lr=self.optm.param_groups[0]["lr"]
+        )
+
         # tb writer
         log_dir = (
             self.opt["train"]["net_ckpt_dir"]
@@ -442,7 +510,9 @@ class AvatarTrainer:
                 items = to_cuda(items)
 
                 # one_step_start.record()
-                total_loss, batch_losses = self.forward_one_pass(items)
+                total_loss, batch_losses = self.forward_one_pass(
+                    items, ddp_avatar_net, ddp_optimizer
+                )
                 # one_step_end.record()
                 # torch.cuda.synchronize()
                 # print('One step costs %f secs' % (one_step_start.elapsed_time(one_step_end) / 1000.))
@@ -501,6 +571,9 @@ class AvatarTrainer:
 
                 if self.iter_idx == self.iter_num:
                     print("# Training is done.")
+
+                    # Clean up
+                    self.cleanup()
                     return
 
                 self.iter_idx += 1
@@ -1028,6 +1101,20 @@ if __name__ == "__main__":
     # torch.autograd.set_detect_anomaly(True)
     from argparse import ArgumentParser
 
+    # Master address and port for distributed training
+    # Need to check how to configure this on CSC's side
+    # print("Master address:", os.environ["MASTER_ADDR"])
+    # print("Master port:", os.environ["MASTER_PORT"])
+    # os.environ["MASTER_ADDR"] = "localhost"
+    # os.environ["MASTER_PORT"] = "12345"
+
+    # Available GPUs and print them out
+    world_size = torch.cuda.device_count()
+    print("World size: ", world_size)
+    for i in range(torch.cuda.device_count()):
+        print(torch.cuda.get_device_properties(i).name)
+    print()
+
     arg_parser = ArgumentParser()
     arg_parser.add_argument(
         "-c", "--config_path", type=str, help="Configuration file path."
@@ -1048,8 +1135,12 @@ if __name__ == "__main__":
             and not safe_exists(config.opt["train"]["pretrained_dir"])
             and not safe_exists(config.opt["train"]["prev_ckpt"])
         ):
-            trainer.pretrain()
-        trainer.train()
+            torch.multiprocessing.spawn(
+                trainer.pretrain, args=(world_size,), nprocs=world_size, join=True
+            )
+        torch.multiprocessing.spawn(
+            trainer.train, args=(world_size,), nprocs=world_size, join=True
+        )
     elif config.opt["mode"] == "test":
         trainer.test()
     else:
