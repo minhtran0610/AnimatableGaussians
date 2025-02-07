@@ -28,8 +28,8 @@ from utils.renderer import Renderer
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 # os.environ['TORCH_USE_CUDA_DSA'] = '1'
-os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
-os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
+os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 
@@ -303,6 +303,10 @@ class AvatarTrainer:
     def setup(self, rank, world_size):
         print("Setting up: Rank %d, world size %d" % (rank, world_size))
         with torch.device(f"cuda:{rank}"):
+            print(f"CUDA device: {torch.cuda.current_device()}")
+            print(
+                "Device name:", torch.cuda.get_device_name(torch.cuda.current_device())
+            )
             dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
     def cleanup(self):
