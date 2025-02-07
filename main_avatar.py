@@ -5,6 +5,13 @@ import importlib
 import os
 import shutil
 
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# os.environ['TORCH_USE_CUDA_DSA'] = '1'
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
 import config
 import cv2 as cv
 import numpy as np
@@ -25,12 +32,6 @@ from tqdm import tqdm
 from utils.net_util import to_cuda
 from utils.obj_io import save_mesh_as_ply
 from utils.renderer import Renderer
-
-# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-# os.environ['TORCH_USE_CUDA_DSA'] = '1'
-os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
-os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 
 def safe_exists(path):
@@ -301,6 +302,7 @@ class AvatarTrainer:
 
     # Setup distributed process
     def setup(self, rank, world_size):
+        print()
         print("Setting up: Rank %d, world size %d" % (rank, world_size))
         with torch.device(f"cuda:{rank}"):
             print(f"CUDA device: {torch.cuda.current_device()}")
