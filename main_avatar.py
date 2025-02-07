@@ -28,6 +28,8 @@ from utils.renderer import Renderer
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 # os.environ['TORCH_USE_CUDA_DSA'] = '1'
+os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 
@@ -300,8 +302,8 @@ class AvatarTrainer:
     # Setup distributed process
     def setup(self, rank, world_size):
         print("Setting up: Rank %d, world size %d" % (rank, world_size))
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
+        with torch.device(f"cuda:{rank}"):
+            dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
     def cleanup(self):
         dist.destroy_process_group()
@@ -318,9 +320,9 @@ class AvatarTrainer:
         batch_size = self.opt["train"]["batch_size"]
         num_workers = self.opt["train"]["num_workers"]
         batch_num = len(self.dataset) // batch_size
-        print()
-        print("Batch number: %d" % batch_num)
-        print("Batch size: %d" % batch_size)
+        # print()
+        # print("Batch number: %d" % batch_num)
+        # print("Batch size: %d" % batch_size)
 
         # Distributed sampling
         data_sampler = DistributedSampler(self.dataset)
@@ -332,8 +334,8 @@ class AvatarTrainer:
             drop_last=True,
             sampler=data_sampler,
         )
-        print("Batch size after distributed sampling: %d" % len(dataloader))
-        print()
+        # print("Batch size after distributed sampling: %d" % len(dataloader))
+        # print()
 
         # Distributed avatar net
         ddp_avatar_net = torch.nn.parallel.DistributedDataParallel(
@@ -1095,13 +1097,17 @@ if __name__ == "__main__":
 
     # Master address and port for distributed training
     # Need to check how to configure this on CSC's side
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12345"
+    # print("Master address:", os.environ["MASTER_ADDR"])
+    # print("Master port:", os.environ["MASTER_PORT"])
+    # os.environ["MASTER_ADDR"] = "localhost"
+    # os.environ["MASTER_PORT"] = "12345"
 
     # Available GPUs and print them out
     world_size = torch.cuda.device_count()
     print("World size: ", world_size)
-    print("GPU info: ", torch.cuda.get_device_name())
+    for i in range(torch.cuda.device_count()):
+        print(torch.cuda.get_device_properties(i).name)
+    print()
 
     arg_parser = ArgumentParser()
     arg_parser.add_argument(
