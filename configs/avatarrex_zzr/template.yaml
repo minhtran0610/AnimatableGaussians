@@ -3,7 +3,7 @@ train:
   dataset: MvRgbDatasetAvatarReX
   data:
     subject_name: avatarrex_zzr
-    data_dir: /home/minhtran/Code/raw_datasets/avatarrex/avatarrex_zzr
+    data_dir: /home/minhtran/Code/data/avatarrex/zzr
     frame_range:
     - 0
     - 1
