@@ -1,25 +1,26 @@
 import platform
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+import config
+import cv2 as cv
 import numpy as np
 import pytorch3d.ops
 import pytorch3d.transforms
-import cv2 as cv
-
-import config
-from network.styleunet.dual_styleunet import DualStyleUNet
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from gaussians.gaussian_model import GaussianModel
 from gaussians.gaussian_renderer import render3
+from network.styleunet.dual_styleunet import DualStyleUNet
 
 
 class AvatarNet(nn.Module):
-    def __init__(self, opt):
+    def __init__(self, opt, rank: int = 0):
         super(AvatarNet, self).__init__()
         self.opt = opt
 
         self.random_style = opt.get("random_style", False)
         self.with_viewdirs = opt.get("with_viewdirs", True)
+        self.rank = rank
 
         # init canonical gausssian model
         self.max_sh_degree = 0
@@ -30,7 +31,7 @@ class AvatarNet(nn.Module):
             cv.IMREAD_UNCHANGED,
         )
         self.cano_smpl_map = (
-            torch.from_numpy(cano_smpl_map).to(torch.float32).to(config.device)
+            torch.from_numpy(cano_smpl_map).to(torch.float32).to(f"cuda:{self.rank}")
         )
         self.cano_smpl_mask = torch.linalg.norm(self.cano_smpl_map, dim=-1) > 0.0
         self.init_points = self.cano_smpl_map[self.cano_smpl_mask]
@@ -42,7 +43,7 @@ class AvatarNet(nn.Module):
                 )
             )
             .to(torch.float32)
-            .to(config.device)
+            .to(f"cuda:{self.rank}")
         )
         self.cano_gaussian_model.create_from_pcd(
             self.init_points, torch.rand_like(self.init_points), spatial_lr_scale=2.5
@@ -50,22 +51,28 @@ class AvatarNet(nn.Module):
 
         self.color_net = DualStyleUNet(
             inp_size=512, inp_ch=3, out_ch=3, out_size=1024, style_dim=512, n_mlp=2
-        )
+        ).to(f"cuda:{self.rank}")
         self.position_net = DualStyleUNet(
             inp_size=512, inp_ch=3, out_ch=3, out_size=1024, style_dim=512, n_mlp=2
-        )
+        ).to(f"cuda:{self.rank}")
         self.other_net = DualStyleUNet(
             inp_size=512, inp_ch=3, out_ch=8, out_size=1024, style_dim=512, n_mlp=2
-        )
+        ).to(f"cuda:{self.rank}")
 
         self.color_style = torch.ones(
-            [1, self.color_net.style_dim], dtype=torch.float32, device=config.device
+            [1, self.color_net.style_dim],
+            dtype=torch.float32,
+            device=f"cuda:{self.rank}",
         ) / np.sqrt(self.color_net.style_dim)
         self.position_style = torch.ones(
-            [1, self.position_net.style_dim], dtype=torch.float32, device=config.device
+            [1, self.position_net.style_dim],
+            dtype=torch.float32,
+            device=f"cuda:{self.rank}",
         ) / np.sqrt(self.position_net.style_dim)
         self.other_style = torch.ones(
-            [1, self.other_net.style_dim], dtype=torch.float32, device=config.device
+            [1, self.other_net.style_dim],
+            dtype=torch.float32,
+            device=f"cuda:{self.rank}",
         ) / np.sqrt(self.other_net.style_dim)
 
         if self.with_viewdirs:
@@ -75,7 +82,7 @@ class AvatarNet(nn.Module):
                 cv.IMREAD_UNCHANGED,
             )
             self.cano_nml_map = (
-                torch.from_numpy(cano_nml_map).to(torch.float32).to(config.device)
+                torch.from_numpy(cano_nml_map).to(torch.float32).to(f"cuda:{self.rank}")
             )
             self.cano_nmls = self.cano_nml_map[self.cano_smpl_mask]
             self.viewdir_net = nn.Sequential(
@@ -106,7 +113,9 @@ class AvatarNet(nn.Module):
             [smpl_pos_map[:, :pos_map_size], smpl_pos_map[:, pos_map_size:]], 2
         )
         smpl_pos_map = smpl_pos_map.transpose((2, 0, 1))
-        pose_map = torch.from_numpy(smpl_pos_map).to(torch.float32).to(config.device)
+        pose_map = (
+            torch.from_numpy(smpl_pos_map).to(torch.float32).to(f"cuda:{self.rank}")
+        )
         pose_map = pose_map[:3]
 
         cano_pts = self.get_positions(pose_map)
@@ -246,7 +255,9 @@ class AvatarNet(nn.Module):
         Note that no batch index in items.
         """
         bg_color = (
-            torch.from_numpy(np.asarray(bg_color)).to(torch.float32).to(config.device)
+            torch.from_numpy(np.asarray(bg_color))
+            .to(torch.float32)
+            .to(f"cuda:{self.rank}")
         )
         pose_map = items["smpl_pos_map"][:3]
         assert not (use_pca and use_vae), "Cannot use both PCA and VAE!"

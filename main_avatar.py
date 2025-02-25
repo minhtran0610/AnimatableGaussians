@@ -1,16 +1,18 @@
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1")
+os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import collections
 import datetime
 import glob
 import importlib
-import os
 import shutil
-
-# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-# os.environ['TORCH_USE_CUDA_DSA'] = '1'
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
-os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 import config
 import cv2 as cv
@@ -34,6 +36,9 @@ from utils.obj_io import save_mesh_as_ply
 from utils.renderer import Renderer
 
 
+torch.cuda.empty_cache()
+
+
 def safe_exists(path):
     if path is None:
         return False
@@ -45,12 +50,12 @@ class AvatarTrainer:
         self.opt = opt
         self.patch_size = 512
         self.iter_idx = 0
-        self.iter_num = 5000
+        self.iter_num = 50000
         self.lr_init = float(self.opt["train"].get("lr_init", 5e-4))
 
-        avatar_module = self.opt["model"].get("module", "network.avatar")
-        print("Import AvatarNet from %s" % avatar_module)
-        AvatarNet = importlib.import_module(avatar_module).AvatarNet
+        self.avatar_module = self.opt["model"].get("module", "network.avatar")
+        print("Import AvatarNet from %s" % self.avatar_module)
+        AvatarNet = importlib.import_module(self.avatar_module).AvatarNet
         self.avatar_net = AvatarNet(self.opt["model"]).to(config.device)
         self.optm = torch.optim.Adam(self.avatar_net.parameters(), lr=self.lr_init)
 
@@ -146,7 +151,12 @@ class AvatarTrainer:
         ).mean()
         return lpips_loss
 
-    def forward_one_pass_pretrain(self, items, ddp_avatar_net, ddp_optimizer):
+    def forward_one_pass_pretrain(
+        self,
+        items,
+        ddp_avatar_net: torch.nn.parallel.DistributedDataParallel,
+        ddp_optimizer: torch.optim.Optimizer,
+    ):
         total_loss = 0
         batch_losses = {}
         l1_loss = torch.nn.L1Loss()
@@ -190,7 +200,13 @@ class AvatarTrainer:
 
         return total_loss, batch_losses
 
-    def forward_one_pass(self, items, ddp_avatar_net, ddp_optimizer):
+    def forward_one_pass(
+        self,
+        items,
+        ddp_avatar_net: torch.nn.parallel.DistributedDataParallel,
+        ddp_optimizer: torch.optim.Optimizer,
+        rank: int,
+    ):
         # forward_start = torch.cuda.Event(enable_timing = True)
         # forward_end = torch.cuda.Event(enable_timing = True)
         # backward_start = torch.cuda.Event(enable_timing = True)
@@ -204,7 +220,7 @@ class AvatarTrainer:
             self.bg_color_cuda = (
                 torch.from_numpy(np.asarray(self.bg_color))
                 .to(torch.float32)
-                .to(config.device)
+                .to(f"cuda:{rank}")
             )
 
         # Reset the loss
@@ -301,22 +317,35 @@ class AvatarTrainer:
         return total_loss, batch_losses
 
     # Setup distributed process
-    def setup(self, rank, world_size):
+    def setup(self, rank: int, world_size: int, config_path: str):
         print()
         print("Setting up: Rank %d, world size %d" % (rank, world_size))
-        with torch.device(f"cuda:{rank}"):
-            print(f"CUDA device: {torch.cuda.current_device()}")
-            print(
-                "Device name:", torch.cuda.get_device_name(torch.cuda.current_device())
-            )
-            dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+        torch.cuda.set_device(f"cuda:{rank}")
+        print(f"CUDA device: {torch.cuda.current_device()}")
+        print("Device name:", torch.cuda.get_device_name(torch.cuda.current_device()))
+
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+        # Init AvatarNet
+        config.load_global_opt(config_path)
+        AvatarNet = importlib.import_module(self.avatar_module).AvatarNet
+        self.avatar_net = AvatarNet(config.opt["model"], rank=rank).to(
+            torch.cuda.current_device()
+        )
+
+        ddp_avatar_net = torch.nn.parallel.DistributedDataParallel(
+            self.avatar_net, device_ids=[rank]
+        )
+        return ddp_avatar_net
 
     def cleanup(self):
         dist.destroy_process_group()
 
-    def pretrain(self, rank, world_size):
+    def pretrain(self, rank: int, world_size: int, config_path: str):
         # Setup
-        self.setup(rank, world_size)
+        # Distributed avatar net
+        ddp_avatar_net = self.setup(rank, world_size, config_path)
 
         dataset_module = self.opt["train"].get("dataset", "MvRgbDatasetAvatarReX")
         MvRgbDataset = importlib.import_module(
@@ -343,10 +372,6 @@ class AvatarTrainer:
         # print("Batch size after distributed sampling: %d" % len(dataloader))
         # print()
 
-        # Distributed avatar net
-        ddp_avatar_net = torch.nn.parallel.DistributedDataParallel(
-            self.avatar_net, device_ids=[rank]
-        )
         ddp_optimizer = torch.optim.Adam(
             ddp_avatar_net.parameters(), lr=self.optm.param_groups[0]["lr"]
         )
@@ -363,10 +388,11 @@ class AvatarTrainer:
         smooth_losses = {}
 
         for epoch_idx in range(0, 9999999):
+            torch.cuda.empty_cache()
             self.epoch_idx = epoch_idx
             for batch_idx, items in enumerate(dataloader):
                 self.iter_idx = batch_idx + epoch_idx * batch_num
-                items = to_cuda(items)
+                items = to_cuda(items, rank=rank)
 
                 # one_step_start.record()
                 total_loss, batch_losses = self.forward_one_pass_pretrain(
@@ -403,7 +429,9 @@ class AvatarTrainer:
                         fp.write(log_info + "\n")
 
                 if self.iter_idx % 200 == 0 and self.iter_idx != 0:
-                    self.mini_test(pretraining=True)
+                    self.mini_test(
+                        ddp_avatar_net=ddp_avatar_net, rank=rank, pretraining=True
+                    )
 
                 if self.iter_idx == 5000:
                     model_folder = self.opt["train"]["net_ckpt_dir"] + "/pretrained"
@@ -415,9 +443,10 @@ class AvatarTrainer:
                     self.cleanup()
                     return
 
-    def train(self, rank, world_size):
+    def train(self, rank: int, world_size: int, config_path: str):
         # Setup
-        self.setup(rank, world_size)
+        # Distributed avatar net
+        ddp_avatar_net = self.setup(rank, world_size, config_path)
 
         dataset_module = self.opt["train"].get("dataset", "MvRgbDatasetAvatarReX")
         MvRgbDataset = importlib.import_module(
@@ -445,7 +474,7 @@ class AvatarTrainer:
         print()
 
         if "lpips" in self.opt["train"]["loss_weight"]:
-            self.lpips = LPIPS(net="vgg").to(config.device)
+            self.lpips = LPIPS(net="vgg").to(f"cuda:{rank}")
             for p in self.lpips.parameters():
                 p.requires_grad = False
 
@@ -482,10 +511,6 @@ class AvatarTrainer:
         # one_step_start = torch.cuda.Event(enable_timing = True)
         # one_step_end = torch.cuda.Event(enable_timing = True)
 
-        # Distributed avatar net
-        ddp_avatar_net = torch.nn.parallel.DistributedDataParallel(
-            self.avatar_net, device_ids=[rank]
-        )
         ddp_optimizer = torch.optim.Adam(
             ddp_avatar_net.parameters(), lr=self.optm.param_groups[0]["lr"]
         )
@@ -503,15 +528,17 @@ class AvatarTrainer:
         smooth_losses = {}
 
         for epoch_idx in range(start_epoch, 9999999):
+            torch.cuda.empty_cache()
             self.epoch_idx = epoch_idx
             for batch_idx, items in enumerate(dataloader):
                 lr = self.update_lr()
+                ddp_optimizer.param_groups[0]["lr"] = lr
 
-                items = to_cuda(items)
+                items = to_cuda(items, rank=rank)
 
                 # one_step_start.record()
                 total_loss, batch_losses = self.forward_one_pass(
-                    items, ddp_avatar_net, ddp_optimizer
+                    items, ddp_avatar_net, ddp_optimizer, rank=rank
                 )
                 # one_step_end.record()
                 # torch.cuda.synchronize()
@@ -553,7 +580,11 @@ class AvatarTrainer:
                         eval_cano_pts = True
                     else:
                         eval_cano_pts = False
-                    self.mini_test(eval_cano_pts=eval_cano_pts)
+                    self.mini_test(
+                        rank=rank,
+                        eval_cano_pts=eval_cano_pts,
+                        ddp_avatar_net=ddp_avatar_net,
+                    )
 
                 if (
                     self.iter_idx % self.opt["train"]["ckpt_interval"]["batch"] == 0
@@ -595,8 +626,14 @@ class AvatarTrainer:
                 self.save_ckpt(latest_folder)
 
     @torch.no_grad()
-    def mini_test(self, pretraining=False, eval_cano_pts=False):
-        self.avatar_net.eval()
+    def mini_test(
+        self,
+        ddp_avatar_net: torch.nn.parallel.DistributedDataParallel,
+        rank: int,
+        pretraining=False,
+        eval_cano_pts=False,
+    ):
+        ddp_avatar_net.eval()
 
         img_factor = self.opt["train"].get("eval_img_factor", 1.0)
         # training data
@@ -616,11 +653,11 @@ class AvatarTrainer:
             intr=intr,
             exact_hand_pose=True,
         )
-        items = net_util.to_cuda(item, add_batch=False)
+        items = net_util.to_cuda(item, rank=rank, add_batch=False)
 
         # Render the image
-        gs_render = self.avatar_net.render(items, self.bg_color)
-        # gs_render = self.avatar_net.render_debug(items)
+        gs_render = ddp_avatar_net.module.render(items, self.bg_color)
+        # gs_render = ddp_avatar_net.render_debug(items)
         rgb_map = gs_render["rgb_map"]
         rgb_map.clip_(0.0, 1.0)
         rgb_map = (rgb_map.cpu().numpy() * 255).astype(np.uint8)
@@ -641,7 +678,7 @@ class AvatarTrainer:
             os.makedirs(output_dir + "/cano_pts", exist_ok=True)
             save_mesh_as_ply(
                 output_dir + "/cano_pts/iter_%d.ply" % self.iter_idx,
-                (self.avatar_net.init_points + gs_render["offset"]).cpu().numpy(),
+                (ddp_avatar_net.module.init_points + gs_render["offset"]).cpu().numpy(),
             )
 
         # testing data
@@ -660,10 +697,10 @@ class AvatarTrainer:
             intr=intr,
             exact_hand_pose=True,
         )
-        items = net_util.to_cuda(item, add_batch=False)
+        items = net_util.to_cuda(item, rank=rank, add_batch=False)
 
-        gs_render = self.avatar_net.render(items, bg_color=self.bg_color)
-        # gs_render = self.avatar_net.render_debug(items)
+        gs_render = ddp_avatar_net.module.render(items, bg_color=self.bg_color)
+        # gs_render = ddp_avatar_net.render_debug(items)
         rgb_map = gs_render["rgb_map"]
         rgb_map.clip_(0.0, 1.0)
         rgb_map = (rgb_map.cpu().numpy() * 255).astype(np.uint8)
@@ -683,10 +720,10 @@ class AvatarTrainer:
             os.makedirs(output_dir + "/cano_pts", exist_ok=True)
             save_mesh_as_ply(
                 output_dir + "/cano_pts/iter_%d.ply" % self.iter_idx,
-                (self.avatar_net.init_points + gs_render["offset"]).cpu().numpy(),
+                (ddp_avatar_net.init_points + gs_render["offset"]).cpu().numpy(),
             )
 
-        self.avatar_net.train()
+        ddp_avatar_net.train()
 
     @torch.no_grad()
     def test(self):
@@ -1107,7 +1144,6 @@ if __name__ == "__main__":
     # print("Master port:", os.environ["MASTER_PORT"])
     # os.environ["MASTER_ADDR"] = "localhost"
     # os.environ["MASTER_PORT"] = "12345"
-
     # Available GPUs and print them out
     world_size = torch.cuda.device_count()
     print("World size: ", world_size)
@@ -1128,6 +1164,7 @@ if __name__ == "__main__":
     if args.mode is not None:
         config.opt["mode"] = args.mode
 
+    print(config.opt)
     trainer = AvatarTrainer(config.opt)
     if config.opt["mode"] == "train":
         if (
@@ -1136,10 +1173,16 @@ if __name__ == "__main__":
             and not safe_exists(config.opt["train"]["prev_ckpt"])
         ):
             torch.multiprocessing.spawn(
-                trainer.pretrain, args=(world_size,), nprocs=world_size, join=True
+                trainer.pretrain,
+                args=(world_size, args.config_path),
+                nprocs=world_size,
+                join=True,
             )
         torch.multiprocessing.spawn(
-            trainer.train, args=(world_size,), nprocs=world_size, join=True
+            trainer.train,
+            args=(world_size, args.config_path),
+            nprocs=world_size,
+            join=True,
         )
     elif config.opt["mode"] == "test":
         trainer.test()

@@ -29,7 +29,7 @@ train:
   prev_ckpt: null
   ckpt_interval:
     epoch: 10
-    batch: 50000
+    batch: 10000
   eval_interval: 1000
   eval_training_ids:
   - 190

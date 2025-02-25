@@ -3,19 +3,19 @@ import numpy as np
 import config
 
 
-def to_cuda(items: dict, add_batch=False, precision=torch.float32):
+def to_cuda(items: dict, add_batch=False, precision=torch.float32, rank=0):
     items_cuda = dict()
     for key, data in items.items():
         if isinstance(data, torch.Tensor):
-            items_cuda[key] = data.to(config.device)
+            items_cuda[key] = data.to(f"cuda:{rank}")
         elif isinstance(data, np.ndarray):
-            items_cuda[key] = torch.from_numpy(data).to(config.device)
+            items_cuda[key] = torch.from_numpy(data).to(f"cuda:{rank}")
         elif isinstance(data, dict):  # usually some float tensors
             for key2, data2 in data.items():
                 if isinstance(data2, np.ndarray):
-                    data[key2] = torch.from_numpy(data2).to(config.device)
+                    data[key2] = torch.from_numpy(data2).to(f"cuda:{rank}")
                 elif isinstance(data2, torch.Tensor):
-                    data[key2] = data2.to(config.device)
+                    data[key2] = data2.to(f"cuda:{rank}")
                 else:
                     raise TypeError("Do not support other data types.")
                 if (
@@ -52,13 +52,25 @@ def delete_batch_idx(items: dict):
 
 def generate_volume_points(bounds, testing_res=(256, 256, 256)):
     x_coords = torch.linspace(
-        0, 1, steps=testing_res[0], dtype=torch.float32, device=config.device
+        0,
+        1,
+        steps=testing_res[0],
+        dtype=torch.float32,
+        device=config.device,
     ).detach()
     y_coords = torch.linspace(
-        0, 1, steps=testing_res[1], dtype=torch.float32, device=config.device
+        0,
+        1,
+        steps=testing_res[1],
+        dtype=torch.float32,
+        device=config.device(),
     ).detach()
     z_coords = torch.linspace(
-        0, 1, steps=testing_res[2], dtype=torch.float32, device=config.device
+        0,
+        1,
+        steps=testing_res[2],
+        dtype=torch.float32,
+        device=config.device(),
     ).detach()
     xv, yv, zv = torch.meshgrid(
         x_coords, y_coords, z_coords
